@@ -1,0 +1,176 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isAdmin() {
+      return signedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // الحقول التي يملك الطالب تعديلها في ملفه (لا role ولا unlockedGroups مباشرة)
+    function profileKeysOnly(keys) {
+      return keys.hasOnly(['uid', 'name', 'email', 'provider', 'level', 'photoURL', 'emailVerified', 'createdAt', 'updatedAt']);
+    }
+    // فتح قسم برمز: الطالب يرسل {unlockedGroups: القديمة + [key], lastRedeem: {code}}
+    // ونتحقق هنا من أن الرمز موجود ومفعّل وغير منتهٍ وأن key يطابق نطاقه بالضبط.
+    function codeDoc(code) {
+      return get(/databases/$(database)/documents/accessCodes/$(code)).data;
+    }
+    // لاحقة المجموعة: وحدة (بكالوريا) أو فصل، وفارغة لرمز «المادة كاملة».
+    function codeSuffix(c) {
+      return (c.get('unit', null) != null && c.unit != '') ? ('_' + c.unit)
+        : ((c.get('trimester', null) != null && c.trimester != '') ? ('_' + c.trimester) : '');
+    }
+    // مواد الرمز: رمز عادي له module واحد، وعرض المادتين له modules: ['math','physics'].
+    function codeModules(c) {
+      return (c.get('modules', null) != null && c.modules.size() > 0) ? c.modules : [c.get('module', '')];
+    }
+    // كل المفاتيح التي يحقّ لهذا الرمز فتحها (مفتاح لكل مادة).
+    // المواد محصورة في math/physics، لذا نبنيها صراحةً — لا حلقات في لغة القواعد.
+    function codeKeys(c) {
+      return (codeModules(c).hasAll(['math']) ? [c.level + '_math' + codeSuffix(c)] : [])
+        .concat(codeModules(c).hasAll(['physics']) ? [c.level + '_physics' + codeSuffix(c)] : []);
+    }
+    function codeValid(c) {
+      return c.active == true
+        && (c.get('expiresAt', null) == null || c.expiresAt > request.time);
+    }
+    // الاستعمال يُسجَّل في نفس الدفعة (writeBatch) على accessCodes/{code}.usedBy —
+    // getAfter يقرأ حالة الرمز بعد الدفعة، فلا يمكن فتح قسم دون تسجيل الاستعمال.
+    function validRedeem() {
+      let code = request.resource.data.lastRedeem.code;
+      let before = resource.data.get('unlockedGroups', []);
+      let after = request.resource.data.unlockedGroups;
+      let added = after.removeAll(before);
+      let allowed = codeKeys(codeDoc(code));
+      // نتحقق من المفاتيح المضافة مقابل وثيقة الرمز نفسها — لا مقابل ما يدّعيه
+      // العميل في lastRedeem.key. عرض المادتين يضيف مفتاحين في نفس الدفعة.
+      return code is string && code.size() >= 4 && code.size() <= 32
+        && exists(/databases/$(database)/documents/accessCodes/$(code))
+        && codeValid(codeDoc(code))
+        && allowed.size() > 0
+        && added.size() > 0 && added.hasOnly(allowed)
+        && after.hasAll(before)
+        && after.size() <= before.size() + allowed.size()
+        && getAfter(/databases/$(database)/documents/accessCodes/$(code)).data.get('usedBy', []).hasAll([request.auth.uid]);
+    }
+
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+      // الطالب ينشئ ملفه (بلا دور مشرف وبلا أقسام مفتوحة)
+      allow create: if isAdmin()
+        || (signedIn() && request.auth.uid == uid
+            && request.resource.data.get('role', null) != 'admin'
+            && request.resource.data.get('unlockedGroups', []).size() == 0
+            && profileKeysOnly(request.resource.data.keys()));
+      // الطالب يحدّث بيانات ملفه فقط، أو يفتح قسمًا برمز صحيح (يُتحقق منه هنا)
+      allow update: if isAdmin()
+        || (signedIn() && request.auth.uid == uid
+            && request.resource.data.get('role', null) == resource.data.get('role', null)
+            && (
+              profileKeysOnly(request.resource.data.diff(resource.data).affectedKeys())
+              || (
+                request.resource.data.diff(resource.data).affectedKeys().hasOnly(['unlockedGroups', 'lastRedeem', 'updatedAt'])
+                && validRedeem()
+              )
+            ));
+      allow delete: if isAdmin();
+    }
+
+    // الدروس (بيانات وصفية + bunnyVideoId): للمسجّلين فقط — الفيديو نفسه يُحمى في Bunny
+    match /lessons/{lessonId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    // الامتحانات (PDF على R2): للمسجّلين فقط
+    match /exams/{examId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // الحصص المباشرة: قراءة عامة، تعديل للإدارة
+    match /liveSessions/{sessionId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // الاختبارات التفاعلية: قراءة عامة، تعديل للإدارة
+    match /quizzes/{quizId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    // نتائج الطالب: المعرّف = uid_quizId؛ الطالب يقرأ/يكتب نتائجه فقط
+    match /quizResults/{resultId} {
+      allow get: if signedIn() && (resultId.matches('^' + request.auth.uid + '_.*') || isAdmin());
+      allow list: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create, update: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && resultId == request.auth.uid + '_' + request.resource.data.quizId;
+      allow delete: if isAdmin();
+    }
+
+    // طلبات الوصول: معرّف الطلب = uid_groupKey → طلب واحد فقط لكل قسم لكل طالب
+    // (لا تكرار ولا إغراق)، والإدارة فقط تقرأ الكل وتعدّل.
+    function ownPendingRequest(requestId) {
+      return signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.groupKey is string
+        && request.resource.data.groupKey.size() > 0
+        && requestId == request.auth.uid + '_' + request.resource.data.groupKey;
+    }
+    match /accessRequests/{requestId} {
+      allow create: if isAdmin() || ownPendingRequest(requestId);
+      // الطالب يقرأ طلباته فقط (لعرض «قيد المراجعة» ومنع التكرار)
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      // الطالب يعيد إرسال طلب مرفوض فقط (يعود إلى pending) — لا يلمس طلبًا قيد المراجعة أو مقبولًا
+      allow update: if isAdmin()
+        || (ownPendingRequest(requestId)
+            && resource.data.uid == request.auth.uid
+            && resource.data.status == 'rejected');
+      allow delete: if isAdmin();
+    }
+
+    // رموز الدخول: التحقق برمز واحد محدد عبر get فقط (مرفوض إن معطّل أو منتهي)
+    match /accessCodes/{code} {
+      allow get: if signedIn() && resource.data.active == true
+                 && (!('expiresAt' in resource.data) || resource.data.expiresAt == null || resource.data.expiresAt > request.time);
+      allow list, create, delete: if isAdmin();
+      // الطالب يسجّل استعماله فقط: يضيف uid إلى usedBy (مرة واحدة) ضمن حدّ maxUses إن وُجد
+      allow update: if isAdmin()
+        || (signedIn()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedBy', 'lastUsedAt'])
+            && codeValid(resource.data)
+            && request.resource.data.usedBy.hasAll(resource.data.get('usedBy', []))
+            && request.resource.data.usedBy.hasAll([request.auth.uid])
+            && request.resource.data.usedBy.size() <= resource.data.get('usedBy', []).size() + 1
+            && (resource.data.get('usedBy', []).hasAll([request.auth.uid])
+                || resource.data.get('maxUses', null) == null
+                || request.resource.data.usedBy.size() <= resource.data.maxUses));
+    }
+
+    // سجلّ مشاهدة الطالب — يتبعه بين أجهزته (التقدّم، استئناف الفيديو، السلسلة).
+    // قواعد users/{uid} لا تسري على المجموعات الفرعية، لذلك يلزم هذا المطابق.
+    match /users/{uid}/watched/{lessonId} {
+      allow read, write: if signedIn() && (request.auth.uid == uid || isAdmin());
+    }
+
+    // المبيعات والإيرادات: للإدارة فقط — لا يراها الطالب إطلاقًا
+    match /sales/{saleId} {
+      allow read, write: if isAdmin();
+    }
+
+    // إعدادات المنصة (قائمة الأسعار): للإدارة فقط
+    match /settings/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /{document=**} {
+      allow read, write: if isAdmin();
+    }
+  }
+}

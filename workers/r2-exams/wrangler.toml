@@ -1,0 +1,23 @@
+# Cloudflare Worker — أسرار المنصة خارج المتصفح:
+#  - ملفات الامتحانات (PDF) على R2
+#  - فيديو الدروس + الصور المصغّرة على R2 (رفع على أجزاء، مشاهدة برابط موقّع قصير العمر)
+# الأسرار:  openssl rand -hex 32 | npx wrangler secret put MEDIA_SIGNING_KEY
+# النشر:  cd workers/r2-exams && npx wrangler deploy
+name = "sidmokhtar-r2-exams"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "sidmokhtar-exams"   # أنشئه أولًا: npx wrangler r2 bucket create sidmokhtar-exams
+
+[vars]
+FIREBASE_PROJECT_ID = "sidmokhtar-b6532"
+# المسارات المسموح رفعها/حذفها (مفصولة بفاصلة)
+ALLOWED_PREFIXES = "exams/,lessons/"
+# أصول لوحة التحكم المسموح لها بالرفع (CORS). "*" أثناء التطوير، ثم ضع نطاقك.
+ALLOWED_ORIGINS = "*"
+# (اختياري) أصول إضافية للقراءة — الحماية الحقيقية للفيديو وملفات PDF هي الروابط الموقّعة
+# (exp + u + sig) وليس هذا الفحص؛ الصور المصغّرة فقط تُقرأ بلا توقيع.
+# READ_ORIGINS = "https://lmokh-platform.dz,http://localhost:5173"
+READ_ORIGINS = ""
